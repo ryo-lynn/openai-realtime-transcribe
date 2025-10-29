@@ -7,9 +7,10 @@ import sys
 from contextlib import asynccontextmanager
 
 import pyaudio
-import websockets
 import requests
+import websockets
 from dotenv import load_dotenv
+from websockets.exceptions import ConnectionClosed
 
 
 load_dotenv()
@@ -50,17 +51,24 @@ class RealtimeTranscriber:
             self._should_stop.set()
 
     async def run(self) -> None:
+        reconnect_delay = 1
         try:
-            session_token = await self._create_session_token()
-            async with self._connect(session_token) as websocket:
-                print("Connected to realtime endpoint.", flush=True)
-                await self._initialize_session(websocket)
-                sender = asyncio.create_task(self._send_audio(websocket))
-                receiver = asyncio.create_task(self._consume_events(websocket))
-                await self._should_stop.wait()
-                sender.cancel()
-                receiver.cancel()
-                await asyncio.gather(sender, receiver, return_exceptions=True)
+            while not self._should_stop.is_set():
+                try:
+                    session_token = await self._create_session_token()
+                    async with self._connect(session_token) as websocket:
+                        print("Connected to realtime endpoint.", flush=True)
+                        await self._initialize_session(websocket)
+                        await self._session_loop(websocket)
+                    reconnect_delay = 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if self._should_stop.is_set():
+                        break
+                    sys.stderr.write(f"[Realtime Warning] {exc}\n")
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, 30)
         finally:
             self._stream.stop_stream()
             self._stream.close()
@@ -126,6 +134,39 @@ class RealtimeTranscriber:
         }
         await websocket.send(json.dumps(session_update))
 
+    async def _session_loop(self, websocket):
+        sender = asyncio.create_task(self._send_audio(websocket))
+        receiver = asyncio.create_task(self._consume_events(websocket))
+        stop_waiter = asyncio.create_task(self._should_stop.wait())
+
+        done, pending = await asyncio.wait(
+            {sender, receiver, stop_waiter},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if stop_waiter in done:
+            sender.cancel()
+            receiver.cancel()
+            await asyncio.gather(sender, receiver, return_exceptions=True)
+            return
+
+        stop_waiter.cancel()
+        for task in pending:
+            task.cancel()
+
+        results = await asyncio.gather(
+            sender, receiver, stop_waiter, return_exceptions=True
+        )
+
+        errors = [
+            result
+            for result in results
+            if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError)
+        ]
+        if errors:
+            raise errors[0]
+        raise RuntimeError("Realtime tasks exited unexpectedly without an error.")
+
     async def _send_audio(self, websocket):
         loop = asyncio.get_running_loop()
         try:
@@ -148,6 +189,12 @@ class RealtimeTranscriber:
                 )
         except asyncio.CancelledError:
             pass
+        except ConnectionClosed as exc:
+            sys.stderr.write(f"[Realtime Sender Closed] {exc}\n")
+            raise
+        except Exception as exc:  # noqa: BLE001 - log unexpected failures
+            sys.stderr.write(f"[Realtime Sender Error] {exc}\n")
+            raise
 
     async def _consume_events(self, websocket):
         try:
@@ -186,6 +233,12 @@ class RealtimeTranscriber:
                     continue
         except asyncio.CancelledError:
             pass
+        except ConnectionClosed as exc:
+            sys.stderr.write(f"[Realtime Receiver Closed] {exc}\n")
+            raise
+        except Exception as exc:  # noqa: BLE001 - surface unexpected decoder issues
+            sys.stderr.write(f"[Realtime Receiver Error] {exc}\n")
+            raise
 
 
 def main() -> None:
