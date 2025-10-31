@@ -66,10 +66,12 @@ class RealtimeTranscriber:
                 except Exception as exc:
                     if self._should_stop.is_set():
                         break
+                    self._flush_text_buffers("session interrupted")
                     sys.stderr.write(f"[Realtime Warning] {exc}\n")
                     await asyncio.sleep(reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 2, 30)
         finally:
+            self._flush_text_buffers("shutdown")
             self._stream.stop_stream()
             self._stream.close()
             self._audio.terminate()
@@ -133,6 +135,18 @@ class RealtimeTranscriber:
             },
         }
         await websocket.send(json.dumps(session_update))
+
+    def _flush_text_buffers(self, reason: str) -> None:
+        """Log any partial transcripts before clearing buffered fragments."""
+        if not self._text_buffers:
+            return
+        for item_id, fragments in list(self._text_buffers.items()):
+            if not fragments:
+                continue
+            partial = "".join(fragments).strip()
+            if partial:
+                sys.stderr.write(f"[Realtime {reason}] {partial}\n")
+        self._text_buffers.clear()
 
     async def _session_loop(self, websocket):
         sender = asyncio.create_task(self._send_audio(websocket))
