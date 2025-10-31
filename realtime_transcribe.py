@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import math
 import signal
 import sys
 from contextlib import asynccontextmanager
@@ -132,6 +133,9 @@ class RealtimeTranscriber:
                     "prefix_padding_ms": 300,
                     "silence_duration_ms": 500,
                 },
+                "include": [
+                    "item.input_audio_transcription.logprobs",
+                ],
             },
         }
         await websocket.send(json.dumps(session_update))
@@ -147,6 +151,40 @@ class RealtimeTranscriber:
             if partial:
                 sys.stderr.write(f"[Realtime {reason}] {partial}\n")
         self._text_buffers.clear()
+
+    def _compute_avg_logprob(self, logprobs) -> float | None:
+        values: list[float] = []
+
+        def collect(node) -> None:
+            if node is None:
+                return
+            if isinstance(node, (int, float)):
+                values.append(float(node))
+                return
+            if isinstance(node, dict):
+                for key in ("logprob", "token_logprob", "log_prob", "score", "value"):
+                    val = node.get(key)
+                    if isinstance(val, (int, float)):
+                        values.append(float(val))
+                for key in ("top_logprobs", "alternatives", "tokens", "items", "candidates"):
+                    sub = node.get(key)
+                    if isinstance(sub, list):
+                        for item in sub:
+                            collect(item)
+                return
+            if isinstance(node, list):
+                for item in node:
+                    collect(item)
+
+        collect(logprobs)
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    def _logprob_to_probability(self, logprob: float | None) -> float | None:
+        if logprob is None:
+            return None
+        return float(min(max(math.exp(logprob), 0.0), 1.0))
 
     async def _session_loop(self, websocket):
         sender = asyncio.create_task(self._send_audio(websocket))
@@ -229,7 +267,12 @@ class RealtimeTranscriber:
                     if item_id in self._text_buffers:
                         self._text_buffers.pop(item_id, None)
                     if transcript:
-                        print(transcript.strip(), flush=True)
+                        line = transcript.strip()
+                        avg_logprob = self._compute_avg_logprob(event.get("logprobs"))
+                        confidence = self._logprob_to_probability(avg_logprob)
+                        if confidence is not None:
+                            line = f"{line} (confidence={confidence:.1%})"
+                        print(line, flush=True)
                 elif event_type == "input_audio_buffer.committed":
                     pass
                 elif event_type == "input_audio_buffer.cleared":
